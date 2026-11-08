@@ -3,19 +3,16 @@
 
 PREFIX  ?= $(HOME)/.local
 BINDIR  ?= $(PREFIX)/bin
-LIBDIR  ?= $(PREFIX)/lib/mux
 MUX     := $(CURDIR)/mux
 
 TESTS   := tests/mux-scratch-tmux.sh tests/mux-tmux-shell.sh
 
-.PHONY: help install install-lib uninstall test lint check
+.PHONY: help install uninstall test lint check
 
 help:
 	@printf '%s\n' \
 	  'make install       symlink mux into $(BINDIR)' \
-	  'make install-lib   symlink this directory at $(LIBDIR) (for configs that' \
-	  '                   name a helper path directly, e.g. kitty keymaps)' \
-	  'make uninstall     remove those symlinks' \
+	  'make uninstall     remove that symlink' \
 	  'make test          run the behaviour tests' \
 	  'make lint          shellcheck every script' \
 	  'make check         parse every script (sh -n)'
@@ -25,14 +22,8 @@ install:
 	ln -sfn "$(MUX)" "$(BINDIR)/mux"
 	@printf 'installed %s -> %s\n' "$(BINDIR)/mux" "$(MUX)"
 
-install-lib:
-	ln -sfn "$(CURDIR)" "$(LIBDIR)"
-	@printf 'installed %s -> %s\n' "$(LIBDIR)" "$(CURDIR)"
-
 uninstall:
-	@for f in "$(BINDIR)/mux" "$(LIBDIR)"; do \
-	  if [ -L "$$f" ]; then rm -f "$$f" && printf 'removed %s\n' "$$f"; fi; \
-	done
+	@if [ -L "$(BINDIR)/mux" ]; then rm -f "$(BINDIR)/mux" && printf 'removed %s\n' "$(BINDIR)/mux"; fi
 
 test:
 	@set -e; for t in $(TESTS); do printf '== %s\n' "$$t"; sh "$$t"; done

@@ -27,15 +27,8 @@ script should reference the checkout path.
 make install BINDIR="$HOME/bin"
 ```
 
-Some terminal configs name a helper directly instead of going through `mux`
-(a kitty keymap that runs `split.sh`, for example). Those need the directory on
-a stable path:
-
-```sh
-make install-lib     # ~/.local/lib/mux -> this repo
-```
-
-Both symlinks come off with `make uninstall`.
+Nothing else is installed: the facade finds the helpers next to itself, so no
+helper directory has to exist anywhere.
 
 ## Verbs
 
