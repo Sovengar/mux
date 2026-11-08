@@ -1,0 +1,780 @@
+#!/bin/sh
+# mux presents one command in the terminal multiplexer around us.
+# It resolves a backend (herdr, tuios, kitty, wezterm, tmux) and a layout
+# (pane, tab, popup/overlay), then runs the command.
+# It is not AI-specific: any command can be presented this way.
+set -eu
+
+usage() {
+	cat <<'EOF'
+mux - present a command in tmux, herdr, tuios, kitty or wezterm
+
+Usage:
+  mux [options] -- COMMAND [ARG...]
+  mux <verb> [args...]        named mux action (run `mux verbs`)
+
+Options:
+  --backend auto|tmux|herdr|tuios|kitty|wezterm|none
+                        backend (default: auto)
+  --layout auto|pane|tab|popup|overlay
+                        presentation (default: auto -> pane)
+  --direction right|down|left|up
+                        pane split direction (default: right); a split with no
+                        command just opens a new shell in that pane
+  --working-dir DIR     working directory (default: $PWD)
+  --cwd DIR             alias for --working-dir
+  --container NAME      workspace (herdr) or session (tmux/tuios) to open in;
+                        reuses it when it exists, otherwise creates it
+  --pane ID             herdr pane to split; default: the current pane
+  --label NAME          tab/pane/popup label (default: mux, or session-id)
+  --session-id ID       full label for tab/popup when --label is absent
+  --width SIZE          popup width (default: 80%; popup only, deprecated)
+  --height SIZE         popup height (default: 80%; popup only, deprecated)
+  --tmux-client TTY     tmux client that shows the popup; needed when mux runs
+                        outside tmux (default: the attached client, if any)
+  --no-focus            do not focus the new pane/tab (where supported)
+  --dry-run             print the resolved plan and exit
+  -h, --help            show this help
+
+Backends:
+  auto: HERDR_ENV=1 -> herdr, TUIOS_ENV=1 -> tuios,
+        KITTY_LISTEN_ON -> kitty, WEZTERM_PANE -> wezterm,
+        TMUX -> tmux, else none.
+  none: exec the command in the current terminal.
+
+Notes:
+  --container is a container, not a layout: herdr calls it a workspace,
+  tmux and tuios call it a session, and popup/overlay ignore it.
+  popup: floating box (herdr plugin popup pane, tmux display-popup, tuios
+  popup, kitty overlay). overlay: full-size layer on the active pane (herdr
+  split + zoom, kitty overlay, tmux display-popup, tuios popup). wezterm has
+  neither; both degrade to a pane.
+  popup is legacy: while a herdr popup pane is open the whole window redraws
+  on every keystroke, so the mux helpers ask for overlay. Keep popup only for
+  an explicit tmux display-popup request.
+  a tmux popup needs an attached client. Inside a pane $TMUX names it; a kitty
+  map or a herdr key runs outside tmux, so mux asks the server for a live
+  client (tmux list-clients) instead of trusting an exported variable.
+  kitty overlays need remote control enabled.
+  tmux popups need tmux >= 3.2.
+EOF
+}
+
+die() {
+	printf 'mux: %s\n' "$*" >&2
+	exit 2
+}
+
+quote() {
+	_q=$1
+	_q=$(printf '%s' "$_q" | sed "s/'/'\\\\''/g")
+	printf "'%s'" "$_q"
+}
+
+shell_join() {
+	_join=
+	for _arg in "$@"; do
+		_q=$(quote "$_arg")
+		if [ -z "$_join" ]; then
+			_join=$_q
+		else
+			_join="$_join $_q"
+		fi
+	done
+	printf '%s' "$_join"
+}
+
+# Join arguments into a command line that stays readable in a pane, quoting only
+# the arguments that need it. herdr types the command into the pane, so
+# "exec 'sh' '-c' 'lazygit'" becomes "exec sh -c lazygit".
+plain_join() {
+	_plain=
+	for _arg in "$@"; do
+		case $_arg in
+		*[!A-Za-z0-9_./:=@%+,-]* | '')
+			_q=$(quote "$_arg")
+			;;
+		*) _q=$_arg ;;
+		esac
+		if [ -z "$_plain" ]; then
+			_plain=$_q
+		else
+			_plain="$_plain $_q"
+		fi
+	done
+	printf '%s' "$_plain"
+}
+
+resolve_backend() {
+	case $backend in
+	tmux | herdr | tuios | kitty | wezterm | none) return 0 ;;
+	auto)
+		if [ "${HERDR_ENV:-}" = 1 ] && command -v herdr >/dev/null 2>&1; then
+			backend=herdr
+		elif [ "${TUIOS_ENV:-}" = 1 ] && command -v tuios >/dev/null 2>&1; then
+			backend=tuios
+		elif [ -n "${KITTY_LISTEN_ON:-}" ] && command -v kitty >/dev/null 2>&1; then
+			backend=kitty
+		elif [ -n "${WEZTERM_PANE:-}" ] && command -v wezterm >/dev/null 2>&1; then
+			backend=wezterm
+		elif [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+			backend=tmux
+		else
+			backend=none
+		fi
+		;;
+	*) die "unknown backend: $backend" ;;
+	esac
+}
+
+# A tmux popup needs an attached client. Inside a pane $TMUX names it; a kitty
+# map or a herdr key runs outside tmux, so ask the server for a live client
+# instead of trusting an exported variable. MUX_TMUX_CLIENT picks one by hand.
+attached_tmux_client() {
+	if [ -n "${MUX_TMUX_CLIENT:-}" ]; then
+		printf '%s' "$MUX_TMUX_CLIENT"
+		return 0
+	fi
+	[ -n "${TMUX:-}" ] && return 0
+	command -v tmux >/dev/null 2>&1 || return 0
+	_clients=$(tmux list-clients -F '#{client_name}' 2>/dev/null || true)
+	[ -n "$_clients" ] || return 0
+	# Several clients may be attached. When tmux runs inside a herdr pane, the
+	# right one is the client whose tty is that pane's tty: herdr reports the
+	# shell pid, and /proc/<pid>/fd/0 names the pts the pane owns.
+	_pane_tty=$(herdr_pane_tty)
+	if [ -n "$_pane_tty" ]; then
+		for _c in $_clients; do
+			if [ "$_c" = "$_pane_tty" ]; then
+				printf '%s' "$_c"
+				return 0
+			fi
+		done
+		# This pane runs no client: another pane's client must not draw our
+		# popup, so report none and let the caller use the overlay.
+		return 0
+	fi
+	printf '%s' "$_clients" | head -n 1
+}
+
+# tty (pts) owned by the focused herdr pane, or nothing outside herdr.
+herdr_pane_tty() {
+	[ "${HERDR_ENV:-}" = 1 ] || return 0
+	command -v herdr >/dev/null 2>&1 || return 0
+	_pid=$(herdr pane process-info --current 2>/dev/null |
+		sed -n 's/.*"shell_pid":\([0-9][0-9]*\).*/\1/p' || true)
+	[ -n "$_pid" ] || return 0
+	readlink -f "/proc/$_pid/fd/0" 2>/dev/null || true
+}
+
+herdr_pane_id() {
+	sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+tuios_pane_id() {
+	sed -n 's/.*"window_id":"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+herdr_workspace_id_by_label() {
+	herdr workspace list 2>/dev/null |
+		jq -r --arg name "$1" '.result.workspaces[] | select(.label == $name) | .workspace_id' |
+		head -n 1
+}
+
+herdr_ensure_workspace() {
+	command -v jq >/dev/null 2>&1 ||
+		die "the herdr backend needs jq to resolve --container"
+	_ws=$(herdr_workspace_id_by_label "$1")
+	if [ -z "$_ws" ]; then
+		_out=$(herdr workspace create --label "$1" --cwd "$cwd" --no-focus)
+		_ws=$(printf '%s' "$_out" | jq -r '.result.workspace.workspace_id // empty')
+		[ -n "$_ws" ] || die "could not create herdr workspace: $1"
+	fi
+	printf '%s' "$_ws"
+}
+
+herdr_workspace_pane() {
+	herdr pane list 2>/dev/null |
+		jq -r --arg ws "$1" '.result.panes[] | select(.workspace_id == $ws) | .pane_id' |
+		head -n 1
+}
+
+# Zoom lives in zoom.sh: each stack implements it differently, so mux only says
+# "make this pane cover the tab" and the helper decides how.
+zoom_pane() {
+	_zoom=$(mux_lib_dir)/zoom.sh
+	[ -x "$_zoom" ] || die "zoom.sh not found at $_zoom"
+	"$_zoom" on "$1" >/dev/null 2>&1 || die "could not zoom pane: $1"
+}
+
+run_tmux() {
+	_popup_client=
+	[ -n "$tmux_client" ] && _popup_client="-c $tmux_client"
+	_tsess=
+	if [ -n "$container" ]; then
+		_tsess=$container
+		if ! tmux has-session -t "=$_tsess" 2>/dev/null; then
+			tmux new-session -d -s "$_tsess" -c "$cwd"
+		fi
+		if [ "$focus" = 1 ]; then
+			tmux switch-client -t "$_tsess" 2>/dev/null || true
+		fi
+	fi
+	case $layout in
+	pane)
+		_axis=-h
+		_bias=
+		case $direction in
+		down) _axis=-v ;;
+		up) _axis=-v _bias=-b ;;
+		left) _bias=-b ;;
+		esac
+		_focus=
+		[ "$focus" = 0 ] && _focus=-d
+		_target=
+		[ -n "$_tsess" ] && _target="-t $_tsess"
+		if [ "$no_cmd" = 1 ]; then
+			# shellcheck disable=SC2086
+			tmux split-window "$_axis" $_bias $_focus $_target -c "$cwd"
+		else
+			# shellcheck disable=SC2086
+			tmux split-window "$_axis" $_bias $_focus $_target -c "$cwd" "$cmd"
+		fi
+		;;
+	tab)
+		_focus=
+		[ "$focus" = 0 ] && _focus=-d
+		if [ -n "$_tsess" ]; then
+			tmux new-window $_focus -t "$_tsess" -c "$cwd" -n "$label" "$cmd"
+		else
+			tmux new-window $_focus -c "$cwd" -n "$label" "$cmd"
+		fi
+		;;
+	popup | overlay)
+		# A cell size larger than the client fails hard ("width too large" /
+		# "height too large"), so shrink it to the client instead.
+		_w=$width
+		_h=$height
+		# shellcheck disable=SC2086 # _popup_client is "-c CLIENT" and must split
+		_cw=$(tmux display-message -p $_popup_client '#{client_width}' 2>/dev/null || true)
+		# shellcheck disable=SC2086
+		_ch=$(tmux display-message -p $_popup_client '#{client_height}' 2>/dev/null || true)
+		case $_w in
+		'' | *[!0-9]*) ;;
+		*) [ -n "$_cw" ] && [ "$_w" -ge "$_cw" ] && _w=$((_cw - 2)) ;;
+		esac
+		case $_h in
+		'' | *[!0-9]*) ;;
+		*) [ -n "$_ch" ] && [ "$_h" -ge "$_ch" ] && _h=$((_ch - 2)) ;;
+		esac
+		# shellcheck disable=SC2086
+		tmux display-popup $_popup_client -E -d "$cwd" -T "$label" -w "$_w" -h "$_h" "$cmd"
+		;;
+	esac
+}
+
+run_herdr() {
+	_ws=
+	if [ -n "$container" ] && [ "$layout" != popup ]; then
+		_ws=$(herdr_ensure_workspace "$container")
+		if [ "$focus" = 1 ]; then
+			herdr workspace focus "$_ws" >/dev/null 2>&1 || true
+		fi
+	fi
+	case $layout in
+	pane)
+		_focus=--focus
+		[ "$focus" = 0 ] && _focus=--no-focus
+		# herdr only grows panes right or down; the left/up sides degrade.
+		_hdir=$direction
+		case $direction in
+		left) _hdir=right ;;
+		up) _hdir=down ;;
+		esac
+		_target=
+		if [ -n "$_ws" ]; then
+			_target=$(herdr_workspace_pane "$_ws")
+			[ -n "$_target" ] || die "no pane in herdr workspace: $container"
+		elif [ -n "$pane_id" ]; then
+			_target=$pane_id
+		fi
+		if [ -n "$_target" ]; then
+			_out=$(herdr pane split --pane "$_target" --direction "$_hdir" --cwd "$cwd" "$_focus")
+		else
+			_out=$(herdr pane split --current --direction "$_hdir" --cwd "$cwd" "$_focus")
+		fi
+		_pane=$(printf '%s' "$_out" | herdr_pane_id)
+		[ -n "$_pane" ] || die "could not resolve the herdr pane id"
+		# herdr only grows right/down. For left/up, swap the new pane with the
+		# neighbour on that side so it looks like it was inserted there.
+		case $direction in
+		left | up) herdr pane swap --pane "$_pane" --direction "$direction" >/dev/null 2>&1 || true ;;
+		esac
+		[ "$no_cmd" = 1 ] || herdr pane run "$_pane" "$plain_cmd"
+		;;
+	tab)
+		_focus=--focus
+		[ "$focus" = 0 ] && _focus=--no-focus
+		if [ -n "$_ws" ]; then
+			_out=$(herdr tab create --workspace "$_ws" --cwd "$cwd" --label "$label" "$_focus")
+		else
+			_out=$(herdr tab create --cwd "$cwd" --label "$label" "$_focus")
+		fi
+		_pane=$(printf '%s' "$_out" | herdr_pane_id)
+		[ -n "$_pane" ] || die "could not resolve the herdr pane id"
+		herdr pane run "$_pane" "$plain_cmd"
+		;;
+	overlay)
+		# A plugin pane started with an argv command closes when that command
+		# exits. The overlay placement is unusable here: herdr rejects
+		# --target-pane for it and always claims the active pane, which is the
+		# last focused tab when the keymap runs detached. The zoomed placement
+		# accepts --target-pane, covers the tab like an overlay and closes with
+		# its command.
+		_focus=--focus
+		[ "$focus" = 0 ] && _focus=--no-focus
+		_target=${pane_id:-${HERDR_PANE_ID:-}}
+		_target_arg=
+		[ -n "$_target" ] && _target_arg="--target-pane $_target"
+		# shellcheck disable=SC2086
+		if _out=$(herdr plugin pane open \
+			--plugin herdr.mux --entrypoint run --placement zoomed $_target_arg \
+			--cwd "$cwd" --env "MUX_COMMAND=$cmd" --env MUX_IN_POPUP=1 "$_focus" 2>&1); then
+			exit 0
+		fi
+		printf 'mux: herdr.mux overlay plugin unavailable; using a zoomed split\n' >&2
+		if [ -n "$_target" ]; then
+			_out=$(herdr pane split --pane "$_target" --direction "$direction" --cwd "$cwd" "$_focus")
+		else
+			_out=$(herdr pane split --current --direction "$direction" --cwd "$cwd" "$_focus")
+		fi
+		_pane=$(printf '%s' "$_out" | herdr_pane_id)
+		[ -n "$_pane" ] || die "could not resolve the herdr pane id"
+		zoom_pane "$_pane" || true
+		# exec so the pane closes when the command exits instead of leaving a
+		# shell prompt behind.
+		herdr pane run "$_pane" "exec $plain_cmd"
+		;;
+	popup)
+		# herdr popups are real: the herdr.mux plugin opens a popup pane and runs
+		# the command through MUX_COMMAND. Fall back to a zoomed split when the
+		# plugin is not installed.
+		_focus=--focus
+		[ "$focus" = 0 ] && _focus=--no-focus
+		# herdr allows one popup at a time. A popup that just closed can still be
+		# reported as open for a moment, so retry briefly before degrading.
+		_try=0
+		while [ "$_try" -lt 20 ]; do
+			_out=$(herdr plugin pane open \
+				--plugin herdr.mux --entrypoint run --placement popup \
+				--width "$width" --height "$height" \
+				--cwd "$cwd" --env "MUX_COMMAND=$cmd" --env MUX_IN_POPUP=1 "$_focus" 2>&1) &&
+				exit 0
+			case $_out in
+			*ui_busy*) _try=$((_try + 1)); sleep 0.1 ;;
+			*) break ;;
+			esac
+		done
+		printf 'mux: herdr.mux popup plugin unavailable; using an overlay\n' >&2
+		if [ -n "$pane_id" ]; then
+			_out=$(herdr pane split --pane "$pane_id" --direction "$direction" --cwd "$cwd" "$_focus")
+		else
+			_out=$(herdr pane split --current --direction "$direction" --cwd "$cwd" "$_focus")
+		fi
+		_pane=$(printf '%s' "$_out" | herdr_pane_id)
+		[ -n "$_pane" ] || die "could not resolve the herdr pane id"
+		zoom_pane "$_pane" || true
+		# exec, so a busy popup slot cannot leave a shell prompt showing the command.
+		herdr pane run "$_pane" "exec $plain_cmd"
+		;;
+	esac
+}
+
+run_tuios() {
+	_sess=${container:-${TUIOS_SESSION:-}}
+	case $layout in
+	pane)
+		if [ -n "$_sess" ]; then
+			_out=$(tuios split-window "$direction" -s "$_sess" --json)
+		else
+			_out=$(tuios split-window "$direction" --json)
+		fi
+		_pane=$(printf '%s' "$_out" | tuios_pane_id)
+		[ -n "$_pane" ] || die "could not resolve the tuios pane id"
+		if [ "$no_cmd" = 0 ]; then
+			if [ -n "$_sess" ]; then
+				tuios send-text -s "$_sess" -w "$_pane" "$cmd
+"
+			else
+				tuios send-text -w "$_pane" "$cmd
+"
+			fi
+		fi
+		;;
+	tab)
+		if [ -n "$_sess" ]; then
+			tuios new-window "$label" -s "$_sess" --cwd "$cwd" --keep-open -- sh -c "$cmd"
+		else
+			tuios new-window "$label" --cwd "$cwd" --keep-open -- sh -c "$cmd"
+		fi
+		;;
+	popup | overlay)
+		if [ -n "$_sess" ]; then
+			tuios popup -s "$_sess" --cwd "$cwd" --name "$label" --width "$width" --height "$height" -- sh -c "$cmd"
+		else
+			tuios popup --cwd "$cwd" --name "$label" --width "$width" --height "$height" -- sh -c "$cmd"
+		fi
+		;;
+	esac
+}
+
+run_kitty() {
+	_focus=
+	[ "$focus" = 0 ] && _focus=--keep-focus
+	case $layout in
+	pane)
+		# kitty can only add windows after the active one: left/up degrade.
+		case $direction in
+		down | up) _loc=hsplit ;;
+		*) _loc=vsplit ;;
+		esac
+		if [ "$no_cmd" = 1 ]; then
+			kitty @ launch --type=window --location="$_loc" --cwd "$cwd" --title "$label" $_focus
+		else
+			kitty @ launch --type=window --location="$_loc" --cwd "$cwd" --title "$label" $_focus -- "$@"
+		fi
+		;;
+	tab)
+		kitty @ launch --type=tab --tab-title "$label" --cwd "$cwd" $_focus -- "$@"
+		;;
+	popup | overlay)
+		kitty @ launch --type=overlay --title "$label" --cwd "$cwd" $_focus -- "$@"
+		;;
+	esac
+}
+
+run_wezterm() {
+	case $layout in
+	pane)
+		case $direction in
+		down) _axis=--bottom ;;
+		up) _axis=--top ;;
+		left) _axis=--left ;;
+		*) _axis=--right ;;
+		esac
+		if [ "$no_cmd" = 1 ]; then
+			wezterm cli split-pane "$_axis" --cwd "$cwd"
+		else
+			wezterm cli split-pane "$_axis" --cwd "$cwd" -- "$@"
+		fi
+		;;
+	tab)
+		wezterm cli spawn --cwd "$cwd" -- "$@"
+		;;
+	esac
+}
+
+############ mux verbs ##########################################################
+# mux is the single entrypoint for mux actions, so a keybinding or a script says
+# `mux new_tab` or `mux split right` instead of naming a helper file. The helpers
+# in $MUX_LIB_DIR stay the implementation; this dispatch is only the facade.
+# The verb list is data: `mux verbs` prints it and the tests read the line.
+# shellcheck disable=SC2034
+VERBS="new_tab close_pane zoom split multi scratch scratch_tmux launch"
+
+# The helpers sit next to this file, so the lib dir is the directory mux itself
+# lives in. `$0` may be a symlink (`~/.local/bin/mux` -> this repo), so resolve
+# the link chain first; MUX_LIB_DIR still wins when set.
+mux_self_dir() {
+	_self=$0
+	while [ -L "$_self" ]; do
+		_link=$(readlink "$_self")
+		case $_link in
+		/*) _self=$_link ;;
+		*) _self=$(dirname "$_self")/$_link ;;
+		esac
+	done
+	# CDPATH= in front of cd stops cd from printing a path; the space is required.
+	# shellcheck disable=SC1007
+	CDPATH= cd -- "$(dirname "$_self")" && pwd
+}
+
+mux_lib_dir() {
+	if [ -n "${MUX_LIB_DIR:-}" ]; then
+		printf '%s' "$MUX_LIB_DIR"
+	else
+		mux_self_dir
+	fi
+}
+
+usage_verbs() {
+	cat <<'EOF'
+mux <verb> [args...]
+
+  new_tab              new tab in the focused pane directory
+  close_pane           close the focused pane
+  zoom [on|off|toggle] maximise the focused pane
+  split right|down|left|up
+                       new shell pane on that side
+  multi [options] --pane CMD[@SIZE:POSITION[:TARGET]] ...
+                       open a multi-pane group as one tab; `multi --kill`
+                       closes the whole group (any pane count)
+  scratch              scratch shell overlay
+  scratch_tmux         scratch shell in a native tmux popup
+  launch APP [args...] run an app in the layer it wants (see `mux launch`)
+
+Apps for `mux launch`:
+  git | edit | projects
+                       picker overlay, then present the chosen app
+  browser              terminal browser in a right split
+  vault                Obsidian vault in the editor
+  tsk | dbx            tsk overlay, dbx overlay
+  actions              show-actions catalog in an overlay
+EOF
+}
+
+dispatch_verb() {
+	_lib=$(mux_lib_dir)
+	[ -d "$_lib" ] || die "mux helpers not found at $_lib (set MUX_LIB_DIR)"
+	_verb=$1
+	shift
+	case $_verb in
+	new_tab) exec "$_lib/new-tab.sh" "$@" ;;
+	close_pane) exec "$_lib/close-pane.sh" "$@" ;;
+	zoom) exec "$_lib/zoom.sh" "$@" ;;
+	split) exec "$_lib/split.sh" "$@" ;;
+	multi) exec "$_lib/multi.sh" "$@" ;;
+	scratch)
+		exec "$_lib/pane-env.sh" scratch 70% 70% -- "$_lib/scratch.sh" "$@"
+		;;
+	scratch_tmux)
+		# tmux popups are opt-in: a herdr popup pane is slow (the whole window
+		# redraws on every keystroke), so the mux helpers stay on overlay. This
+		# verb also needs an attached tmux client: `tmux display-popup` fails
+		# with "no current client" outside one. Inside a pane $TMUX answers that;
+		# from a kitty map or a herdr key the server names its clients instead.
+		_client=$(attached_tmux_client)
+		if [ -n "${TMUX:-}" ] || [ -n "$_client" ]; then
+			_client_arg=
+			[ -n "$_client" ] && _client_arg="--tmux-client $_client"
+			# shellcheck disable=SC2086
+			exec mux --backend tmux --layout popup $_client_arg --label scratch \
+				--width "${MUX_SCRATCH_WIDTH:-40}" \
+				--height "${MUX_SCRATCH_HEIGHT:-60}" \
+				--cwd "${MUX_PANE_CWD:-$PWD}" -- "$_lib/scratch.sh" "$@"
+		fi
+		# No client to draw a popup on. Hand the pane a tmux client that pops the
+		# popup as its only window command: the overlay pty is a real terminal, so
+		# this still ends in a tmux popup, and closing it ends the session.
+		if command -v tmux >/dev/null 2>&1; then
+			_cwd=${MUX_PANE_CWD:-$PWD}
+			printf 'mux: no attached tmux client; opening the popup in an overlay\n' >&2
+			exec "$_lib/pane-env.sh" scratch 70% 70% -- \
+				tmux new-session -s "mux-popup-$$" -c "$_cwd" \
+				"tmux display-popup -E -d '$_cwd' -w 40% -h 60% '\"\${SHELL:-/bin/sh}\" -l'; exit"
+		fi
+		printf 'mux: tmux not installed; using a plain overlay\n' >&2
+		exec "$_lib/pane-env.sh" scratch 70% 70% -- "$_lib/scratch.sh" "$@"
+		;;
+	launch)
+		# One verb for "run an app the way that app wants to be shown". The app
+		# names the what; the layer stays an implementation detail here instead of
+		# leaking into the keybinding table.
+		_app=${1:-}
+		[ -n "$_app" ] || {
+			usage_verbs >&2
+			exit 2
+		}
+		shift
+		case $_app in
+		browser) exec "$_lib/browser.sh" "$@" ;;
+		git) exec "$_lib/picker-run.sh" git "$_lib/git-picker.sh" ;;
+		edit) exec "$_lib/picker-run.sh" edit "$_lib/editor-explorer.sh" ;;
+		projects)
+			exec "$_lib/picker-run.sh" projects \
+				"${MUX_PROJECTS_SCRIPT:-$HOME/.config/herdr/scripts/projects.sh}"
+			;;
+		vault) exec "$_lib/pane-env.sh" vault -- "$_lib/vault.sh" "$@" ;;
+		tsk)
+			# A zoomed split needs no slot.
+			# shellcheck source=identity.sh
+# shellcheck disable=SC1091 # sourced by absolute path at run time
+			. "$_lib/identity.sh"
+			exec mux --layout overlay --label tsk --cwd "${MUX_PANE_CWD:-$PWD}" -- tsk "$@"
+			;;
+		dbx) exec "$_lib/pane-env.sh" dbx -- dbx "$@" ;;
+		actions) exec "$_lib/pane-env.sh" actions 90 90 -- show-actions "$@" ;;
+		*)
+			printf 'mux launch: unknown app: %s\n' "$_app" >&2
+			printf 'apps: browser git edit projects vault tsk dbx actions\n' >&2
+			exit 2
+			;;
+		esac
+		;;
+	esac
+}
+
+backend=auto
+layout=auto
+direction=right
+cwd=
+container=
+label=mux
+label_set=0
+session_id=
+width=80%
+height=80%
+tmux_client=
+pane_id=
+focus=1
+dry_run=0
+
+case ${1:-} in
+verbs | --verbs)
+	usage_verbs
+	exit 0
+	;;
+new_tab | close_pane | zoom | split | multi | scratch | scratch_tmux | launch)
+	dispatch_verb "$@"
+	;;
+esac
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--backend)
+		backend=$2
+		shift 2
+		;;
+	--layout)
+		layout=$2
+		shift 2
+		;;
+	--direction)
+		direction=$2
+		shift 2
+		;;
+	--working-dir | --cwd)
+		cwd=$2
+		shift 2
+		;;
+	--container)
+		container=$2
+		shift 2
+		;;
+	--pane)
+		pane_id=$2
+		shift 2
+		;;
+	--label)
+		label=$2
+		label_set=1
+		shift 2
+		;;
+	--session-id)
+		session_id=$2
+		shift 2
+		;;
+	--width)
+		width=$2
+		shift 2
+		;;
+	--height)
+		height=$2
+		shift 2
+		;;
+	--tmux-client)
+		tmux_client=$2
+		shift 2
+		;;
+	--no-focus)
+		focus=0
+		shift
+		;;
+	--dry-run)
+		dry_run=1
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	--)
+		shift
+		break
+		;;
+	*)
+		die "unknown option: $1"
+		;;
+	esac
+done
+
+# A pane split without a command opens a plain shell in the new pane; every
+# other layout needs a command to present.
+no_cmd=0
+if [ $# -eq 0 ]; then
+	no_cmd=1
+fi
+
+case $container in
+*'{{'*) die "unresolved placeholder in --container: $container" ;;
+esac
+
+cwd=${cwd:-$PWD}
+case $direction in
+right | down | left | up) ;;
+*) die "unknown direction: $direction" ;;
+esac
+[ "$layout" = auto ] && layout=pane
+case $layout in
+pane | tab | popup | overlay) ;;
+*) die "unknown layout: $layout" ;;
+esac
+
+if [ -n "$session_id" ] && [ "$label_set" = 0 ]; then
+	label=$session_id
+fi
+
+resolve_backend
+if [ "$no_cmd" = 1 ] && [ "$layout" != pane ]; then
+	die "no command given for layout: $layout"
+fi
+if [ "$backend" = wezterm ] && { [ "$layout" = popup ] || [ "$layout" = overlay ]; }; then
+	printf 'mux: wezterm has no floating popup; using a pane\n' >&2
+	layout=pane
+fi
+if [ -n "$container" ] && { [ "$backend" = kitty ] || [ "$backend" = wezterm ] || [ "$backend" = none ]; }; then
+	printf 'mux: %s has no workspace/session container; ignoring --container\n' "$backend" >&2
+fi
+
+cmd=
+plain_cmd=
+if [ "$no_cmd" = 0 ]; then
+	cmd=$(shell_join "$@")
+	plain_cmd=$(plain_join "$@")
+fi
+
+# herdr allows one popup at a time: inside a mux popup a nested popup request
+# takes over that popup instead of failing (or degrading to a split).
+if [ "$layout" = popup ] && [ "${MUX_IN_POPUP:-}" = 1 ]; then
+	exec "$@"
+fi
+
+if [ "$dry_run" = 1 ]; then
+	printf 'backend=%s\nlayout=%s\ndirection=%s\ncwd=%s\ncontainer=%s\nlabel=%s\ncommand=%s\n' \
+		"$backend" "$layout" "$direction" "$cwd" "$container" "$label" "$cmd"
+	exit 0
+fi
+
+case $backend in
+tmux) run_tmux ;;
+herdr) run_herdr ;;
+tuios) run_tuios ;;
+kitty) run_kitty "$@" ;;
+wezterm) run_wezterm "$@" ;;
+none)
+	if [ "$no_cmd" = 1 ]; then
+		die "layout pane needs a multiplexer"
+	fi
+	exec "$@"
+	;;
+esac
