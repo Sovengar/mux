@@ -480,7 +480,7 @@ run_wezterm() {
 # in $MUX_LIB_DIR stay the implementation; this dispatch is only the facade.
 # The verb list is data: `mux verbs` prints it and the tests read the line.
 # shellcheck disable=SC2034
-VERBS="new_tab close_pane zoom split multi scratch scratch_tmux launch"
+VERBS="new_tab close_pane zoom next_tab prev_tab tab1 tab2 tab3 tab4 tab5 tab6 tab7 tab8 tab9 split multi scratch scratch_tmux launch"
 
 # The helpers sit next to this file, so the lib dir is the directory mux itself
 # lives in. `$0` may be a symlink (`~/.local/bin/mux` -> this repo), so resolve
@@ -514,6 +514,8 @@ mux <verb> [args...]
   new_tab              new tab in the focused pane directory
   close_pane           close the focused pane
   zoom [on|off|toggle] maximise the focused pane
+  next_tab / prev_tab  next / previous herdr tab (wraps around)
+  tab1 .. tab9         herdr tab by position, 1 is the leftmost tab
   split right|down|left|up
                        new shell pane on that side
   multi [options] --pane CMD[@SIZE:POSITION[:TARGET]] ...
@@ -542,6 +544,9 @@ dispatch_verb() {
 	new_tab) exec "$_lib/new-tab.sh" "$@" ;;
 	close_pane) exec "$_lib/close-pane.sh" "$@" ;;
 	zoom) exec "$_lib/zoom.sh" "$@" ;;
+	next_tab) exec "$_lib/tab.sh" next ;;
+	prev_tab) exec "$_lib/tab.sh" prev ;;
+	tab[1-9]) exec "$_lib/tab.sh" "${_verb#tab}" ;;
 	split) exec "$_lib/split.sh" "$@" ;;
 	multi) exec "$_lib/multi.sh" "$@" ;;
 	scratch)
@@ -641,7 +646,7 @@ verbs | --verbs)
 	usage_verbs
 	exit 0
 	;;
-new_tab | close_pane | zoom | split | multi | scratch | scratch_tmux | launch)
+new_tab | close_pane | zoom | next_tab | prev_tab | tab[1-9] | split | multi | scratch | scratch_tmux | launch)
 	dispatch_verb "$@"
 	;;
 esac

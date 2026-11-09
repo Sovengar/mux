@@ -36,6 +36,8 @@ helper directory has to exist anywhere.
 mux new_tab              new tab in the focused pane directory
 mux close_pane           close the focused pane
 mux zoom [on|off|toggle] maximise the focused pane
+mux next_tab | prev_tab  next / previous herdr tab (wraps around)
+mux tab1 .. tab9         herdr tab by position, 1 is the leftmost tab
 mux split right|down|left|up
                          new shell pane on that side
 mux multi [options] --pane CMD[@SIZE:POSITION[:TARGET]] ...
@@ -45,6 +47,10 @@ mux scratch_tmux         scratch shell in a native tmux popup
 mux launch APP [args...] run an app in the layer it wants
 mux verbs                list them
 ```
+
+The tab verbs are herdr-only: they read the tab bar of the current workspace
+with `herdr tab list`. `next_tab` and `prev_tab` wrap around; a `tabN` that does
+not exist is an error, so a wrong keybinding number never lands on another tab.
 
 `mux launch` presents a picker, then the chosen app: `git`, `edit`, `projects`,
 `browser`, `vault`, `tsk`, `dbx`, `actions`.
@@ -63,6 +69,7 @@ still overrides it.
 | `pane-env.sh` | gives a keymap-launched command a mux identity, then an overlay |
 | `picker-run.sh` | runs a picker in an overlay and presents the choice |
 | `split.sh`, `zoom.sh`, `close-pane.sh`, `new-tab.sh` | one pane action each |
+| `tab.sh` | tab switch by step or position (`next_tab`, `prev_tab`, `tabN`) |
 | `multi.sh` | multi-pane group as a single tab |
 | `scratch.sh` | scratch shell |
 | `browser.sh`, `vault.sh`, `editor-explorer.sh`, `git-picker.sh` | apps behind `mux launch` |

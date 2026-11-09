@@ -5,7 +5,7 @@ PREFIX  ?= $(HOME)/.local
 BINDIR  ?= $(PREFIX)/bin
 MUX     := $(CURDIR)/mux
 
-TESTS   := tests/mux-scratch-tmux.sh tests/mux-tmux-shell.sh
+TESTS   := tests/mux-scratch-tmux.sh tests/mux-tmux-shell.sh tests/mux-tab.sh
 
 .PHONY: help install uninstall test lint check
 
