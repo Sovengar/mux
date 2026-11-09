@@ -79,7 +79,7 @@ run_mux() { # env assignments... -- args handled by caller
 # Scenario 1: TMUX set -> native tmux popup via the existing popup branch.
 out=$(TMUX=/tmp/tmux-test,1,0 run_mux scratch_tmux arg1 2>"$work/err1") || true
 assert_eq "scenario 1: re-execs mux with the tmux popup" \
-	"mux --backend tmux --layout popup --label scratch --width 40 --height 60 --cwd $PWD -- $lib/scratch.sh arg1" \
+	"mux --backend tmux --layout popup --label scratch --width 70% --height 60 --cwd $PWD -- $lib/scratch.sh arg1" \
 	"$out"
 assert_eq "scenario 1: nothing on stderr" "" "$(cat "$work/err1")"
 
@@ -99,7 +99,7 @@ assert_eq "scenario 2: warns on stderr" \
 assert_contains "scenario 2: overlay runs a popup window command" \
 	"pane-env.sh scratch 70% 70% -- tmux new-session -s mux-popup-" "$out"
 assert_contains "scenario 2: popup uses percentages" \
-	"-w 40% -h 60%" "$out"
+	"-w 70% -h 60%" "$out"
 
 # Scenario 3: `mux verbs` lists the verb and describes it.
 out=$(run_mux verbs)
@@ -155,7 +155,7 @@ EOF
 chmod +x "$bin/tmux"
 out=$(env -u TMUX -u HERDR_ENV PATH=$bin:$PATH MUX_LIB_DIR=$lib sh "$mux_src" scratch_tmux arg1 2>"$work/err5") || true
 assert_eq "scenario 5: targets the attached client" \
-	"mux --backend tmux --layout popup --tmux-client /dev/pts/9 --label scratch --width 40 --height 60 --cwd $PWD -- $lib/scratch.sh arg1" \
+	"mux --backend tmux --layout popup --tmux-client /dev/pts/9 --label scratch --width 70% --height 60 --cwd $PWD -- $lib/scratch.sh arg1" \
 	"$out"
 assert_eq "scenario 5: no warning when a client exists" "" "$(cat "$work/err5")"
 
@@ -199,12 +199,41 @@ assert_eq "scenario 6: warns when no client exists" \
 out=$(env -u TMUX MUX_TMUX_CLIENT=/dev/pts/42 PATH=$bin:$PATH MUX_LIB_DIR=$lib \
 	sh "$mux_src" scratch_tmux 2>/dev/null) || true
 assert_eq "scenario 7: MUX_TMUX_CLIENT wins" \
-	"mux --backend tmux --layout popup --tmux-client /dev/pts/42 --label scratch --width 40 --height 60 --cwd $PWD -- $lib/scratch.sh" \
+	"mux --backend tmux --layout popup --tmux-client /dev/pts/42 --label scratch --width 70% --height 60 --cwd $PWD -- $lib/scratch.sh" \
 	"$out"
 
 # Scenario 8: --tmux-client reaches display-popup through the popup branch.
 out=$(run_mux --backend tmux --layout popup --tmux-client /dev/pts/9 --dry-run -- true)
 assert_contains "scenario 8: --tmux-client is an accepted option" "layout=popup" "$out"
+
+# Scenario 11: a keymap-launched process has no pane context, so `herdr pane
+# current` fails. The focused pane from `pane list` must still name the client,
+# otherwise the popup lands in whatever pane owns the first client tty.
+rm -f "$bin/herdr"
+cp "$repo/identity.sh" "$lib/identity.sh"
+cat >"$bin/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+"pane current") printf '{"error":{"code":"pane_not_found"}}\n' && exit 1 ;;
+"pane list") printf '{"result":{"panes":[{"pane_id":"p9","focused":false,"cwd":"/tmp"},{"pane_id":"p7","focused":true,"cwd":"/tmp/focused"}]}}\n' ;;
+"pane process-info") printf '{"result":{"process_info":{"shell_pid":%s}}}\n' "$SHELL_PID" ;;
+esac
+EOF
+chmod +x "$bin/herdr"
+cat >"$bin/tmux" <<'EOF'
+#!/bin/sh
+case $1 in
+list-clients) printf '/dev/pts/2\n%s\n' "$(readlink -f "/proc/$SHELL_PID/fd/0" 2>/dev/null)" ;;
+*) printf 'tmux %s\n' "$*" ;;
+esac
+EOF
+chmod +x "$bin/tmux"
+want_tty=$(readlink -f "/proc/$$/fd/0" 2>/dev/null || true)
+out=$(env -u TMUX -u HERDR_ENV -u HERDR_PANE_ID -u MUX_PANE_CWD \
+	SHELL_PID=$$ PATH=$bin:$PATH MUX_LIB_DIR=$lib sh "$mux_src" scratch_tmux 2>/dev/null) || true
+assert_contains "scenario 11: falls back to the focused pane" \
+	"--tmux-client $want_tty" "$out"
+assert_contains "scenario 11: keeps the pane cwd" "--cwd /tmp/focused" "$out"
 
 # Scenarios 9 and 10 pick a tmux client by matching the caller's pane tty, so
 # they need a real terminal on stdin; without one there is no tty to match.

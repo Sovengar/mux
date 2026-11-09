@@ -553,13 +553,20 @@ dispatch_verb() {
 		# verb also needs an attached tmux client: `tmux display-popup` fails
 		# with "no current client" outside one. Inside a pane $TMUX answers that;
 		# from a kitty map or a herdr key the server names its clients instead.
+		# A kitty map starts outside herdr's env, so recover the focused pane
+		# first: without it the client match falls back to the first client and
+		# the popup lands in whatever pane owns that tty.
+		if [ -f "$_lib/identity.sh" ]; then
+			# shellcheck disable=SC1091 # sourced by absolute path at run time
+			. "$_lib/identity.sh"
+		fi
 		_client=$(attached_tmux_client)
 		if [ -n "${TMUX:-}" ] || [ -n "$_client" ]; then
 			_client_arg=
 			[ -n "$_client" ] && _client_arg="--tmux-client $_client"
 			# shellcheck disable=SC2086
 			exec mux --backend tmux --layout popup $_client_arg --label scratch \
-				--width "${MUX_SCRATCH_WIDTH:-40}" \
+				--width "${MUX_SCRATCH_WIDTH:-70%}" \
 				--height "${MUX_SCRATCH_HEIGHT:-60}" \
 				--cwd "${MUX_PANE_CWD:-$PWD}" -- "$_lib/scratch.sh" "$@"
 		fi
@@ -571,7 +578,7 @@ dispatch_verb() {
 			printf 'mux: no attached tmux client; opening the popup in an overlay\n' >&2
 			exec "$_lib/pane-env.sh" scratch 70% 70% -- \
 				tmux new-session -s "mux-popup-$$" -c "$_cwd" \
-				"tmux display-popup -E -d '$_cwd' -w 40% -h 60% '\"\${SHELL:-/bin/sh}\" -l'; exit"
+				"tmux display-popup -E -d '$_cwd' -w 70% -h 60% '\"\${SHELL:-/bin/sh}\" -l'; exit"
 		fi
 		printf 'mux: tmux not installed; using a plain overlay\n' >&2
 		exec "$_lib/pane-env.sh" scratch 70% 70% -- "$_lib/scratch.sh" "$@"
