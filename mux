@@ -522,7 +522,7 @@ mux <verb> [args...]
                        open a multi-pane group as one tab; `multi --kill`
                        closes the whole group (any pane count)
   scratch              scratch shell overlay
-  scratch_tmux         scratch shell in a native tmux popup
+  scratch_tmux         scratch shell in tmux (popup, or a session in an overlay)
   launch APP [args...] run an app in the layer it wants (see `mux launch`)
 
 Apps for `mux launch`:
@@ -575,15 +575,17 @@ dispatch_verb() {
 				--height "${MUX_SCRATCH_HEIGHT:-60}" \
 				--cwd "${MUX_PANE_CWD:-$PWD}" -- "$_lib/scratch.sh" "$@"
 		fi
-		# No client to draw a popup on. Hand the pane a tmux client that pops the
-		# popup as its only window command: the overlay pty is a real terminal, so
-		# this still ends in a tmux popup, and closing it ends the session.
+		# No client to draw a popup on, and `tmux display-popup` cannot create
+		# one: the window command of `tmux new-session` runs before its client
+		# attaches. So hand the overlay pty a tmux client attached to a fresh
+		# session: the pane is the client, the session is the scratch, and the
+		# session dies with its only client.
 		if command -v tmux >/dev/null 2>&1; then
 			_cwd=${MUX_PANE_CWD:-$PWD}
-			printf 'mux: no attached tmux client; opening the popup in an overlay\n' >&2
+			printf 'mux: no attached tmux client; hosting the scratch in an overlay\n' >&2
 			exec "$_lib/pane-env.sh" scratch 70% 70% -- \
-				tmux new-session -s "mux-popup-$$" -c "$_cwd" \
-				"tmux display-popup -E -d '$_cwd' -w 70% -h 60% '\"\${SHELL:-/bin/sh}\" -l'; exit"
+				tmux new-session -s "mux-scratch-$$" -c "$_cwd" \; \
+				set-option destroy-unattached on
 		fi
 		printf 'mux: tmux not installed; using a plain overlay\n' >&2
 		exec "$_lib/pane-env.sh" scratch 70% 70% -- "$_lib/scratch.sh" "$@"

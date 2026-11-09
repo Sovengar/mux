@@ -94,18 +94,18 @@ assert_eq "scenario 1: honours MUX_SCRATCH_* and MUX_PANE_CWD" \
 # scratch shell is still a real tmux pane.
 out=$(env -u TMUX PATH=$bin:$PATH MUX_LIB_DIR=$lib sh "$mux_src" scratch_tmux arg1 2>"$work/err2") || true
 assert_eq "scenario 2: warns on stderr" \
-	"mux: no attached tmux client; opening the popup in an overlay" \
+	"mux: no attached tmux client; hosting the scratch in an overlay" \
 	"$(cat "$work/err2")"
-assert_contains "scenario 2: overlay runs a popup window command" \
-	"pane-env.sh scratch 70% 70% -- tmux new-session -s mux-popup-" "$out"
-assert_contains "scenario 2: popup uses percentages" \
-	"-w 70% -h 60%" "$out"
+assert_contains "scenario 2: overlay hosts a tmux session" \
+	"pane-env.sh scratch 70% 70% -- tmux new-session -s mux-scratch-" "$out"
+assert_contains "scenario 2: the session dies with its client" \
+	"set-option destroy-unattached on" "$out"
 
 # Scenario 3: `mux verbs` lists the verb and describes it.
 out=$(run_mux verbs)
 assert_contains "scenario 3: verbs lists scratch_tmux" "scratch_tmux" "$out"
 assert_contains "scenario 3: verbs describes scratch_tmux" \
-	"scratch_tmux         scratch shell in a native tmux popup" "$out"
+	"scratch_tmux         scratch shell in tmux (popup, or a session in an overlay)" "$out"
 assert_contains "scenario 3: VERBS string contains scratch_tmux" \
 	"scratch scratch_tmux launch" \
 	"$(sed -n 's/^VERBS=//p' "$mux_src")"
@@ -189,10 +189,10 @@ esac
 EOF
 chmod +x "$bin/tmux"
 out=$(env -u TMUX PATH=$bin:$PATH MUX_LIB_DIR=$lib sh "$mux_src" scratch_tmux 2>"$work/err6") || true
-assert_contains "scenario 6: no client -> popup in an overlay" \
-	"tmux new-session -s mux-popup-" "$out"
+assert_contains "scenario 6: no client -> a tmux session in an overlay" \
+	"tmux new-session -s mux-scratch-" "$out"
 assert_eq "scenario 6: warns when no client exists" \
-	"mux: no attached tmux client; opening the popup in an overlay" \
+	"mux: no attached tmux client; hosting the scratch in an overlay" \
 	"$(cat "$work/err6")"
 
 # Scenario 7: MUX_TMUX_CLIENT overrides the detected client.
@@ -294,10 +294,10 @@ if [ -f "$kitty_conf" ] && [ -f "$herdr_conf" ]; then
 	assert_contains "kitty alt+backspace uses mux scratch_tmux" \
 		"map alt+backspace launch --type=background --cwd=current bash $HOME/.local/bin/mux scratch_tmux" \
 		"$(cat "$kitty_conf")"
-	assert_contains "herdr alt+backspace uses mux scratch" \
-		'command = "mux scratch"' "$(cat "$herdr_conf")"
-	assert_contains "herdr describes the overlay" \
-		'description = "scratch shell in an overlay"' "$(cat "$herdr_conf")"
+	assert_contains "herdr alt+backspace uses mux scratch_tmux" \
+		'command = "mux scratch_tmux"' "$(cat "$herdr_conf")"
+	assert_contains "herdr describes the tmux scratch" \
+		'description = "scratch shell in tmux"' "$(cat "$herdr_conf")"
 else
 	skip "terminal config assertions (no configs at $conf_src)"
 fi
