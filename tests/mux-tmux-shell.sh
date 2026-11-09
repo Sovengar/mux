@@ -63,11 +63,16 @@ assert_contains "creates a session per pane" 'session="pane-$$"' "$(cat "$wrappe
 assert_contains "session dies with its client" "destroy-unattached on" "$(cat "$wrapper")"
 assert_contains "status line hidden" "status off" "$(cat "$wrapper")"
 
-# Acceptances: the panes are wired to the wrapper. Skipped on a checkout with
-# no terminal configs.
+# Acceptances: only kitty wires its windows to the wrapper. Herdr panes run a
+# plain shell so Herdr can resolve the pane cwd from the foreground process.
+# Skipped on a checkout with no terminal configs.
 if [ -f "$herdr_conf" ] && [ -f "$kitty_conf" ]; then
-	assert_contains "herdr uses the wrapper as default shell" \
-		"default_shell = \"$HOME/.local/scripts/mux-tmux-shell\"" "$(cat "$herdr_conf")"
+	assert_contains "herdr panes run a plain shell" \
+		'default_shell = "fish"' "$(cat "$herdr_conf")"
+	case $(cat "$herdr_conf") in
+	*mux-tmux-shell*) no "herdr does not wrap panes in a tmux client" "default_shell still names the wrapper" ;;
+	*) ok "herdr does not wrap panes in a tmux client" ;;
+	esac
 	assert_contains "kitty uses the wrapper as shell" \
 		"shell $HOME/.local/scripts/mux-tmux-shell" "$(cat "$kitty_conf")"
 else

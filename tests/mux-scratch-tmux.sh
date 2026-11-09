@@ -294,10 +294,10 @@ if [ -f "$kitty_conf" ] && [ -f "$herdr_conf" ]; then
 	assert_contains "kitty alt+backspace uses mux scratch_tmux" \
 		"map alt+backspace launch --type=background --cwd=current bash $HOME/.local/bin/mux scratch_tmux" \
 		"$(cat "$kitty_conf")"
-	assert_contains "herdr alt+backspace uses mux scratch_tmux" \
-		'command = "mux scratch_tmux"' "$(cat "$herdr_conf")"
-	assert_contains "herdr describes the tmux popup" \
-		'description = "scratch shell in a tmux popup"' "$(cat "$herdr_conf")"
+	assert_contains "herdr alt+backspace uses mux scratch" \
+		'command = "mux scratch"' "$(cat "$herdr_conf")"
+	assert_contains "herdr describes the overlay" \
+		'description = "scratch shell in an overlay"' "$(cat "$herdr_conf")"
 else
 	skip "terminal config assertions (no configs at $conf_src)"
 fi
